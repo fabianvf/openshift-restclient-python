@@ -52,7 +52,7 @@ def cache_decoder(client):
             if _type == 'Resource':
                 return Resource(client=client, **obj)
             elif _type == 'ResourceList':
-                return ResourceList(obj['resource'])
+                return ResourceList(client, **obj)
             return obj
 
     return CacheDecoder
@@ -157,6 +157,7 @@ class DynamicClient(object):
             groups_response = load_json(self.request('GET', '/{}'.format(prefix)))['groups']
 
             groups = self.default_groups()
+            groups['api']['']['v1']['List'] = ResourceList(self)
             groups[prefix] = {}
 
             for group in groups_response:
@@ -200,7 +201,8 @@ class DynamicClient(object):
                 subresources=subresources.get(resource['name']),
                 **resource
             )
-            resources['{}List'.format(resource['kind'])] = ResourceList(resources[resource['kind']])
+            list_kind = '{}List'.format(resource['kind'])
+            resources[list_kind] = ResourceList(self, group=group, api_version=version, kind=list_kind)
         return resources
 
     def ensure_namespace(self, resource, namespace, body):
@@ -480,35 +482,86 @@ class Resource(object):
 class ResourceList(Resource):
     """ Represents a list of API objects """
 
-    def __init__(self, resource):
-        self.resource = resource
-        self.kind = '{}List'.format(resource.kind)
+    def __init__(self, client, group=None, api_version=None, kind=None):
+        self.client = client
+        self.group = group or ''
+        self.api_version = api_version or 'v1'
+        self.kind = kind or 'List'
 
-    def get(self, body=None, **kwargs):
+    def _items_to_resources(self, body):
+        """ Takes a List body and return a dictionary with the following structure:
+            {
+                'api_version': str,
+                'kind': str,
+                'items': [{
+                    'resource': Resource,
+                    'name': str,
+                    'namespace': str,
+                }]
+            }
+        """
         if body is None:
-            return self.resource.get(**kwargs)
+            raise ValueError("You must provide a body when calling methods on a ResourceList")
+
+        api_version = body['apiVersion']
+        kind = body['kind']
+        items = body.get('items')
+        if not items:
+            raise ValueError('The `items` field in the body must be populated when calling methods on a ResourceList')
+
+        if self.kind != kind:
+            raise ValueError('Methods on a {} must be called with a body containing the same kind. Receieved {} instead'.format(self.kind, kind))
+
+        return {
+            'api_version': api_version,
+            'kind': kind,
+            'items': [self._item_to_resource(api_version, kind, item) for item in items]
+        }
+
+    def _item_to_resource(self, api_version, kind, item, resource=None):
+        metadata = item.get('metadata', {})
+        api_version = item.get('apiVersion') or api_version
+        kind = item.get('kind') or kind
+        name = metadata.get('name')
+        namespace = metadata.get('namespace')
+        resource = resource or self.client.resources.get(api_version=api_version, kind=kind)
+        return {
+            'resource': resource,
+            'definition': item,
+            'name': name,
+            'namespace': namespace
+        }
+
+    def get(self, body, name=None, namespace=None, **kwargs):
+        if name:
+            raise ValueError('Operations on ResourceList objects do not support the `name` argument')
+        resource_list = self._items_to_resources(body)
         response = copy.deepcopy(body)
-        namespace = kwargs.pop('namespace', None)
+
         response['items'] = [
-            self.resource.get(name=item['metadata']['name'], namespace=item['metadata'].get('namespace', namespace), **kwargs)
-            for item in body['items']
+            item['resource'].get(name=item['name'], namespace=item['namespace'] or namespace, **kwargs)
+            for item in resource_list['items']
         ]
         return ResourceInstance(self, response)
 
-    def delete(self, body=None, *args, **kwargs):
+    def delete(self, body, name=None, namespace=None, **kwargs):
+        if name:
+            raise ValueError('Operations on ResourceList objects do not support the `name` argument')
+        resource_list = self._items_to_resources(body)
         response = copy.deepcopy(body)
-        namespace = kwargs.pop('namespace', None)
+
         response['items'] = [
-            self.resource.delete(name=item['metadata']['name'], namespace=item['metadata'].get('namespace', namespace), **kwargs)
-            for item in body['items']
+            item['resource'].delete(name=item['name'], namespace=item['namespace'] or namespace, **kwargs)
+            for item in resource_list['items']
         ]
         return ResourceInstance(self, response)
 
-    def verb_mapper(self, verb, body=None, **kwargs):
+    def verb_mapper(self, verb, body, **kwargs):
+        resource_list = self._items_to_resources(body)
         response = copy.deepcopy(body)
         response['items'] = [
-            getattr(self.resource, verb)(body=item, **kwargs)
-            for item in body['items']
+            getattr(item['resource'], verb)(body=item['definition'], **kwargs)
+            for item in resource_list['items']
         ]
         return ResourceInstance(self, response)
 
@@ -521,13 +574,12 @@ class ResourceList(Resource):
     def patch(self, *args, **kwargs):
         return self.verb_mapper('patch', *args, **kwargs)
 
-    def __getattr__(self, name):
-        return getattr(self.resource, name)
-
     def to_dict(self):
         return {
             '_type': 'ResourceList',
-            'resource': self.resource.to_dict(),
+            'group': self.group,
+            'api_version': self.api_version,
+            'kind': self.kind
         }
 
 
